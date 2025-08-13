@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudWatch logging configuration for Glue, Lambda, and Step Functions with retention policies and IAM permissions'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  GlueJobName:
+    Type: String
+    Description: Name of the Glue job
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function
+  StepFunctionsStateMachineName:
+    Type: String
+    Description: Name of the Step Functions state machine
+
+Resources:
+  # CloudWatch Log Groups for Glue Jobs
+  GlueJobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/${GlueJobName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Glue
+
+  GlueJobErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws-glue/jobs/error/${GlueJobName}-${Environment}'
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Glue
+
+  # CloudWatch Log Groups for Lambda Functions
+  LambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}'
+      RetentionInDays: 14
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Lambda
+
+  LambdaFunctionErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunctionName}-errors'
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: Lambda
+
+  # CloudWatch Log Groups for Step Functions
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/states/${StepFunctionsStateMachineName}-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: StepFunctions
+
+  StepFunctionsErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/states/${StepFunctionsStateMachineName}-${Environment}-errors'
+      RetentionInDays: 90
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: StepFunctions
+
+  # IAM Policy for Glue Logging Permissions
+  GlueLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'glue-logging-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt GlueJobLogGroup.Arn
+              - !GetAtt GlueJobErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+
+  # IAM Policy for Lambda Logging Permissions
+  LambdaLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'lambda-logging-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt LambdaFunctionLogGroup.Arn
+              - !GetAtt LambdaFunctionErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+
+  # IAM Policy for Step Functions Logging Permissions
+  StepFunctionsLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub 'stepfunctions-logging-policy-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt StepFunctionsLogGroup.Arn
+              - !GetAtt StepFunctionsErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/states/*'
+
+  # Additional IAM Role Updates for Logging
+  # Update Glue Service Role with logging permissions
+  GlueServiceRoleUpdate:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'glue-cloudwatch-logging-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt GlueJobLogGroup.Arn
+              - !GetAtt GlueJobErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/jobs/*'
+      Roles:
+        - !Sub 'data-pipeline-glue-role-${Environment}'
+
+  # Update Lambda Execution Role with logging permissions
+  LambdaExecutionRoleUpdate:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'lambda-cloudwatch-logging-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt LambdaFunctionLogGroup.Arn
+              - !GetAtt LambdaFunctionErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+      Roles:
+        - !Sub 'redshift-loader-lambda-role-${Environment}'
+
+  # Update Step Functions Execution Role with logging permissions
+  StepFunctionsExecutionRoleUpdate:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'stepfunctions-cloudwatch-logging-${Environment}'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - !GetAtt StepFunctionsLogGroup.Arn
+              - !GetAtt StepFunctionsErrorLogGroup.Arn
+              - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/states/*'
+      Roles:
+        - !Sub 'redshift-transformations-sfn-role-${Environment}'
+
+Outputs:
+  GlueJobLogGroupArn:
+    Description: ARN of the Glue job log group
+    Value: !GetAtt GlueJobLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJobLogGroupArn'
+
+  GlueJobErrorLogGroupArn:
+    Description: ARN of the Glue job error log group
+    Value: !GetAtt GlueJobErrorLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJobErrorLogGroupArn'
+
+  LambdaFunctionLogGroupArn:
+    Description: ARN of the Lambda function log group
+    Value: !GetAtt LambdaFunctionLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionLogGroupArn'
+
+  LambdaFunctionErrorLogGroupArn:
+    Description: ARN of the Lambda function error log group
+    Value: !GetAtt LambdaFunctionErrorLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionErrorLogGroupArn'
+
+  StepFunctionsLogGroupArn:
+    Description: ARN of the Step Functions log group
+    Value: !GetAtt StepFunctionsLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsLogGroupArn'
+
+  StepFunctionsErrorLogGroupArn:
+    Description: ARN of the Step Functions error log group
+    Value: !GetAtt StepFunctionsErrorLogGroup.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsErrorLogGroupArn'
+
+  GlueLoggingPolicyArn:
+    Description: ARN of the Glue logging policy
+    Value: !Ref GlueLoggingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueLoggingPolicyArn'
+
+  LambdaLoggingPolicyArn:
+    Description: ARN of the Lambda logging policy
+    Value: !Ref LambdaLoggingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaLoggingPolicyArn'
+
+  StepFunctionsLoggingPolicyArn:
+    Description: ARN of the Step Functions logging policy
+    Value: !Ref StepFunctionsLoggingPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsLoggingPolicyArn'

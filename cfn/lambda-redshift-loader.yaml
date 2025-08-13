@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda function to load Parquet data from S3 to Redshift'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  ProcessedDataBucketName:
+    Type: String
+    Description: Name of the processed data S3 bucket
+  RedshiftClusterEndpoint:
+    Type: String
+    Description: Redshift cluster endpoint
+  RedshiftDBName:
+    Type: String
+    Description: Redshift database name
+  RedshiftTableName:
+    Type: String
+    Description: Redshift table name
+  RedshiftUsername:
+    Type: String
+    Description: Redshift username
+  RedshiftPassword:
+    Type: String
+    NoEcho: true
+    Description: Redshift password
+
+Resources:
+  # Lambda Function Role
+  RedshiftLoaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'redshift-loader-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RedshiftS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - redshift:GetClusterCredentials
+                  - redshift-data:ExecuteStatement
+                Resource:
+                  - !Sub 'arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:*'
+
+  # Lambda Function
+  RedshiftLoaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'redshift-loader-${Environment}'
+      Handler: index.handler
+      Role: !GetAtt RedshiftLoaderRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          redshift_data = boto3.client('redshift-data')
+
+          def handler(event, context):
+              try:
+                  # Get S3 bucket and key from the event
+                  bucket = event['Records'][0]['s3']['bucket']['name']
+                  key = event['Records'][0]['s3']['object']['key']
+                  
+                  # Get environment variables
+                  cluster_endpoint = os.environ['REDSHIFT_CLUSTER_ENDPOINT']
+                  database = os.environ['REDSHIFT_DATABASE']
+                  table = os.environ['REDSHIFT_TABLE']
+                  username = os.environ['REDSHIFT_USERNAME']
+                  password = os.environ['REDSHIFT_PASSWORD']
+                  
+                  # Construct the COPY command
+                  copy_command = f"""
+                  COPY {table}
+                  FROM 's3://{bucket}/{key}'
+                  FORMAT AS PARQUET
+                  CREDENTIALS 'aws_access_key_id={{{os.environ['AWS_ACCESS_KEY_ID']}}};aws_secret_access_key={{{os.environ['AWS_SECRET_ACCESS_KEY']}}}'
+                  """
+                  
+                  # Execute COPY command
+                  response = redshift_data.execute_statement(
+                      ClusterIdentifier=cluster_endpoint,
+                      Database=database,
+                      DbUser=username,
+                      Sql=copy_command
+                  )
+                  
+                  logger.info(f"Successfully initiated COPY command for s3://{bucket}/{key}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully initiated Redshift COPY command')
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  raise
+
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          REDSHIFT_CLUSTER_ENDPOINT: !Ref RedshiftClusterEndpoint
+          REDSHIFT_DATABASE: !Ref RedshiftDBName
+          REDSHIFT_TABLE: !Ref RedshiftTableName
+          REDSHIFT_USERNAME: !Ref RedshiftUsername
+          REDSHIFT_PASSWORD: !Ref RedshiftPassword
+
+  # S3 Event Trigger
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RedshiftLoaderFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt RedshiftLoaderFunction.Arn

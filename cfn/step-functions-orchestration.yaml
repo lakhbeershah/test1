@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Step Functions orchestration for Redshift SQL transformations'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  RedshiftClusterId:
+    Type: String
+    Description: Redshift cluster identifier
+  RedshiftDBName:
+    Type: String
+    Description: Redshift database name
+  RedshiftTableName:
+    Type: String
+    Description: Redshift table name to load data into
+  RedshiftUsername:
+    Type: String
+    Description: Redshift username
+  RedshiftPassword:
+    Type: String
+    Description: Redshift password
+    NoEcho: true
+
+Resources:
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsRedshiftAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # Step Functions State Machine
+  RedshiftTransformationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'redshift-transformations-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      Definition:
+        Comment: "Orchestrate Redshift SQL transformations"
+        StartAt: RunInitialTransformations
+        States:
+          RunInitialTransformations:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+            Parameters:
+              ClusterIdentifier: !Ref RedshiftClusterId
+              Database: !Ref RedshiftDBName
+              DbUser: !Ref RedshiftUsername
+              Sql: !Sub |
+                -- Perform initial data transformations
+                -- Example: Update statistics, clean up data, etc.
+                ANALYZE ${RedshiftTableName};
+            Next: RunBusinessTransformations
+            ResultPath: $.initialTransformResult
+
+          RunBusinessTransformations:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+            Parameters:
+              ClusterIdentifier: !Ref RedshiftClusterId
+              Database: !Ref RedshiftDBName
+              DbUser: !Ref RedshiftUsername
+              Sql: !Sub |
+                -- Perform business logic transformations
+                -- Example: Aggregate data, create summary tables, etc.
+                CREATE TABLE IF NOT EXISTS ${RedshiftTableName}_summary AS
+                SELECT 
+                  column1,
+                  column2,
+                  COUNT(*) as record_count
+                FROM ${RedshiftTableName}
+                GROUP BY column1, column2;
+            Next: RunDataQualityChecks
+            ResultPath: $.businessTransformResult
+
+          RunDataQualityChecks:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+            Parameters:
+              ClusterIdentifier: !Ref RedshiftClusterId
+              Database: !Ref RedshiftDBName
+              DbUser: !Ref RedshiftUsername
+              Sql: !Sub |
+                -- Perform data quality checks
+                -- Example: Check for nulls, duplicates, etc.
+                SELECT 
+                  COUNT(*) as total_records,
+                  COUNT(column1) as non_null_column1,
+                  COUNT(DISTINCT column1) as distinct_column1
+                FROM ${RedshiftTableName};
+            Next: OptimizeTable
+            ResultPath: $.dataQualityResult
+
+          OptimizeTable:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+            Parameters:
+              ClusterIdentifier: !Ref RedshiftClusterId
+              Database: !Ref RedshiftDBName
+              DbUser: !Ref RedshiftUsername
+              Sql: !Sub |
+                -- Optimize table performance
+                -- Example: Vacuum and analyze
+                VACUUM ${RedshiftTableName};
+            Next: GenerateReports
+            ResultPath: $.optimizeResult
+
+          GenerateReports:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:redshiftdata:executeStatement
+            Parameters:
+              ClusterIdentifier: !Ref RedshiftClusterId
+              Database: !Ref RedshiftDBName
+              DbUser: !Ref RedshiftUsername
+              Sql: !Sub |
+                -- Generate reports or materialized views
+                -- Example: Create a report table
+                CREATE TABLE IF NOT EXISTS ${RedshiftTableName}_report AS
+                SELECT 
+                  DATE_TRUNC('day', created_date) as day,
+                  COUNT(*) as daily_count
+                FROM ${RedshiftTableName}
+                GROUP BY DATE_TRUNC('day', created_date)
+                ORDER BY day DESC;
+            End: true
+            ResultPath: $.reportResult
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref RedshiftTransformationStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  StepFunctionsExecutionRoleArn:
+    Description: ARN of the Step Functions execution role
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsExecutionRoleArn'

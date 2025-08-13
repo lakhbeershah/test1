@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless AWS Data Pipeline with Glue, S3, and CloudWatch'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  S3Bucket:
+    Type: String
+    Description: S3 bucket name for data and artifacts
+  GlueScriptPath:
+    Type: String
+    Description: S3 path to Glue scripts
+
+Resources:
+  # S3 Bucket for raw data
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3Bucket}-raw-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # S3 Bucket for processed data
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${S3Bucket}-processed-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !ImportValue RedshiftLoaderLambdaArn
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # Glue Service Role
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucket}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucket}/*'
+                  - !Sub 'arn:aws:s3:::${S3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucket}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucket}'
+                  - !Sub 'arn:aws:s3:::${S3Bucket}'
+
+  # Glue Database
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub 'data-pipeline-${Environment}'
+        Description: !Sub 'Database for ${Environment} data pipeline'
+
+  # Glue Crawler Role
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: CrawlerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucket}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucket}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucket}'
+
+  # Glue Crawler
+  GlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub 'data-pipeline-crawler-${Environment}'
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DELETE_FROM_DATABASE
+
+  # Glue Job
+  GlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub 'data-processing-job-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub '${GlueScriptPath}data_processing.py'
+        PythonVersion: 3
+      DefaultArguments:
+        '--job-language': python
+        '--job-bookmark-option': job-bookmark-disable
+        '--enable-metrics': ''
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-continuous-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${S3Bucket}/logs/spark/'
+        '--S3_INPUT_PATH': !Sub 's3://${RawDataBucket}/input/'
+        '--S3_OUTPUT_PATH': !Sub 's3://${ProcessedDataBucket}/output/'
+      MaxRetries: 0
+      Timeout: 2880
+      MaxCapacity: 2.0
+      GlueVersion: 3.0
+
+  # CloudWatch Alarm for Glue Job Failures
+  GlueJobFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'glue-job-failure-${Environment}'
+      AlarmDescription: !Sub 'Alarm for Glue job failures in ${Environment}'
+      MetricName: FailedJobs
+      Namespace: Glue
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref GlueJobFailureTopic
+      Dimensions:
+        - Name: JobName
+          Value: !Ref GlueJob
+
+  # CloudWatch Alarm for Raw Data Bucket
+  RawDataBucketAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'raw-data-bucket-alarm-${Environment}'
+      AlarmDescription: !Sub 'Alarm for raw data bucket issues in ${Environment}'
+      MetricName: NumberOfObjects
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref GlueJobFailureTopic
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref RawDataBucket
+        - Name: StorageType
+          Value: StandardStorage
+
+  # CloudWatch Alarm for Processed Data Bucket
+  ProcessedDataBucketAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'processed-data-bucket-alarm-${Environment}'
+      AlarmDescription: !Sub 'Alarm for processed data bucket issues in ${Environment}'
+      MetricName: NumberOfObjects
+      Namespace: AWS/S3
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref GlueJobFailureTopic
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref ProcessedDataBucket
+        - Name: StorageType
+          Value: StandardStorage
+
+  # SNS Topic for Glue Job Failures
+  GlueJobFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'glue-job-failure-topic-${Environment}'
+      DisplayName: !Sub 'Glue Job Failure Notifications (${Environment})'
+
+Outputs:
+  RawDataBucketName:
+    Description: Name of the S3 bucket for raw data
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-RawDataBucketName'
+
+  ProcessedDataBucketName:
+    Description: Name of the S3 bucket for processed data
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessedDataBucketName'
+
+  GlueJobName:
+    Description: Name of the Glue job
+    Value: !Ref GlueJob
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueJobName'
+
+  GlueDatabaseName:
+    Description: Name of the Glue database
+    Value: !Ref GlueDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueDatabaseName'

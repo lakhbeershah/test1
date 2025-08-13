@@ -1,0 +1,325 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda function to load Parquet data from S3 to Amazon Redshift'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  S3ProcessedBucket:
+    Type: String
+    Description: Name of the S3 bucket containing processed Parquet data
+  RedshiftClusterId:
+    Type: String
+    Description: Redshift cluster identifier
+  RedshiftDBName:
+    Type: String
+    Description: Redshift database name
+  RedshiftTableName:
+    Type: String
+    Description: Redshift table name to load data into
+  RedshiftUsername:
+    Type: String
+    Description: Redshift username
+  RedshiftPassword:
+    Type: String
+    Description: Redshift password
+    NoEcho: true
+  RedshiftIAMRole:
+    Type: String
+    Description: IAM role ARN for Redshift to access S3
+  StepFunctionsStateMachineArn:
+    Type: String
+    Description: ARN of the Step Functions state machine for Redshift transformations
+    Default: ""
+    # Now optional
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaS3RedshiftAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3ProcessedBucket}'
+                  - !Sub 'arn:aws:s3:::${S3ProcessedBucket}/*'
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:ListStatements
+                  - redshift:GetClusterCredentials
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Ref RedshiftIAMRole
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref StepFunctionsStateMachineArn
+
+  # Lambda Function
+  RedshiftLoaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'redshift-loader-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          REDSHIFT_CLUSTER_ID: !Ref RedshiftClusterId
+          REDSHIFT_DB_NAME: !Ref RedshiftDBName
+          REDSHIFT_TABLE_NAME: !Ref RedshiftTableName
+          REDSHIFT_USERNAME: !Ref RedshiftUsername
+          REDSHIFT_PASSWORD: !Ref RedshiftPassword
+          REDSHIFT_IAM_ROLE: !Ref RedshiftIAMRole
+          STEP_FUNCTIONS_STATE_MACHINE_ARN: !Ref StepFunctionsStateMachineArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from urllib.parse import unquote_plus
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize clients
+          s3_client = boto3.client('s3')
+          redshift_data_client = boto3.client('redshift-data')
+          stepfunctions_client = boto3.client('stepfunctions')
+
+          def lambda_handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+
+              # Get environment variables
+              cluster_id = os.environ['REDSHIFT_CLUSTER_ID']
+              database_name = os.environ['REDSHIFT_DB_NAME']
+              table_name = os.environ['REDSHIFT_TABLE_NAME']
+              db_user = os.environ['REDSHIFT_USERNAME']
+              # NOTE: For production, use AWS Secrets Manager for credentials
+
+              try:
+                  # Process each S3 event record
+                  for record in event['Records']:
+                      bucket = record['s3']['bucket']['name']
+                      key = unquote_plus(record['s3']['object']['key'])
+
+                      logger.info(f"Processing file: s3://{bucket}/{key}")
+
+                      # Check if it's a Parquet file
+                      if not key.endswith('.parquet'):
+                          logger.info(f"Skipping non-Parquet file: {key}")
+                          continue
+
+                      # Construct S3 path
+                      s3_path = f"s3://{bucket}/{key}"
+
+                      # Create COPY command to load data into Redshift
+                      copy_sql = f"""
+                      COPY {table_name}
+                      FROM '{s3_path}'
+                      IAM_ROLE '{os.environ['REDSHIFT_IAM_ROLE']}'
+                      FORMAT AS PARQUET;
+                      """
+
+                      logger.info(f"Executing COPY command for {s3_path}")
+
+                      # Execute COPY command in Redshift
+                      response = redshift_data_client.execute_statement(
+                          ClusterIdentifier=cluster_id,
+                          Database=database_name,
+                          DbUser=db_user,
+                          Sql=copy_sql
+                      )
+
+                      logger.info(f"COPY command executed. Statement ID: {response['Id']}")
+
+                  # Start Step Functions execution for Redshift transformations if ARN is provided
+                  stepfn_arn = os.environ.get('STEP_FUNCTIONS_STATE_MACHINE_ARN', '')
+                  if stepfn_arn:
+                      stepfunctions_client.start_execution(
+                          stateMachineArn=stepfn_arn,
+                          input=json.dumps({
+                              'redshift_cluster_id': cluster_id,
+                              'redshift_database_name': database_name,
+                              'redshift_table_name': table_name
+                          })
+                      )
+                      logger.info("Step Functions execution started.")
+                  else:
+                      logger.info("No Step Functions ARN provided, skipping orchestration.")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Successfully processed S3 events and started Redshift transformations')
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error processing S3 event: {str(e)}", exc_info=True)
+                  raise e
+
+  # S3 Event Permission
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RedshiftLoaderFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${S3ProcessedBucket}'
+
+  # S3 Bucket Event Notification
+  S3BucketNotification:
+    Type: Custom::S3BucketNotification
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      Bucket: !Ref S3ProcessedBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt RedshiftLoaderFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .parquet
+
+  # Custom resource function to set up S3 notifications
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 's3-notification-setup-${Environment}'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3NotificationRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          # Inline cfnresponse module for custom resource support
+          import sys
+
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+
+          def send(event, context, responseStatus, responseData, physicalResourceId=None, noEcho=False):
+              import urllib.request
+              responseUrl = event['ResponseURL']
+              responseBody = {
+                  'Status': responseStatus,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': physicalResourceId or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': noEcho,
+                  'Data': responseData
+              }
+              json_responseBody = json.dumps(responseBody)
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(json_responseBody))
+              }
+              req = urllib.request.Request(responseUrl, data=json_responseBody.encode(), headers=headers, method='PUT')
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      print("Status code:", response.getcode())
+                      print("Status message:", response.read().decode())
+              except Exception as e:
+                  print("send(..) failed executing urllib.request.urlopen(..):", str(e))
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              props = event['ResourceProperties']
+
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # Remove notification configuration
+                      s3.put_bucket_notification_configuration(
+                          Bucket=props['Bucket'],
+                          NotificationConfiguration={}
+                      )
+                      send(event, context, SUCCESS, {})
+                      return
+
+                  # Set up notification configuration
+                  s3.put_bucket_notification_configuration(
+                      Bucket=props['Bucket'],
+                      NotificationConfiguration=props['NotificationConfiguration']
+                  )
+
+                  send(event, context, SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send(event, context, FAILED, {})
+
+  # IAM role for S3 notification function
+  S3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub 'arn:aws:s3:::${S3ProcessedBucket}'
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref RedshiftLoaderFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt RedshiftLoaderFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'

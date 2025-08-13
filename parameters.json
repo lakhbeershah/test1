@@ -1,0 +1,36 @@
+{
+    "Parameters": [
+        {
+            "ParameterKey": "Environment",
+            "ParameterValue": "dev"
+        },
+        {
+            "ParameterKey": "S3Bucket",
+            "ParameterValue": "your-bucket-name"
+        },
+        {
+            "ParameterKey": "RedshiftClusterEndpoint",
+            "ParameterValue": "your-cluster-endpoint"
+        },
+        {
+            "ParameterKey": "RedshiftDBName",
+            "ParameterValue": "your-database"
+        },
+        {
+            "ParameterKey": "RedshiftTableName",
+            "ParameterValue": "your-table"
+        },
+        {
+            "ParameterKey": "RedshiftUsername",
+            "ParameterValue": "your-username"
+        },
+        {
+            "ParameterKey": "RedshiftPassword",
+            "ParameterValue": "your-password"
+        },
+        {
+            "ParameterKey": "GlueScriptPath",
+            "ParameterValue": "s3://your-bucket-name/glue/scripts/"
+        }
+    ]
+}

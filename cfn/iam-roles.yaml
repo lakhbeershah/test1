@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM roles with least privilege for S3, Glue, Lambda, Step Functions, and Redshift'
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, prod]
+    Description: Environment name
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for data and artifacts
+  RawDataBucketName:
+    Type: String
+    Description: Name of the raw data S3 bucket
+  ProcessedDataBucketName:
+    Type: String
+    Description: Name of the processed data S3 bucket
+  GlueDatabaseName:
+    Type: String
+    Description: Name of the Glue database
+  RedshiftClusterId:
+    Type: String
+    Description: Redshift cluster identifier
+  RedshiftDBName:
+    Type: String
+    Description: Redshift database name
+  RedshiftTableName:
+    Type: String
+    Description: Redshift table name to load data into
+
+Resources:
+  # S3 Role for accessing raw and processed data buckets
+  S3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'data-pipeline-s3-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 
+                - glue.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub 's3-data-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+
+  # Glue Service Role for ETL jobs
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'data-pipeline-glue-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub 'glue-s3-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/logs/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${RawDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+        - PolicyName: !Sub 'glue-catalog-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetJob
+                  - glue:GetJobs
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                Resource: 
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/*'
+
+  # Glue Crawler Role
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'data-pipeline-crawler-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: !Sub 'crawler-s3-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+
+  # Lambda Execution Role for Redshift loader
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'redshift-loader-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub 'lambda-s3-redshift-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:ListStatements
+                  - redshift:GetClusterCredentials
+                Resource: 
+                  - !Sub 'arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${RedshiftClusterId}'
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: 
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*'
+
+  # Step Functions Execution Role for Redshift transformations
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'redshift-transformations-sfn-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub 'stepfunctions-redshift-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:DescribeStatement
+                  - redshift-data:GetStatementResult
+                Resource:
+                  - !Sub 'arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${RedshiftClusterId}'
+              - Effect: Allow
+                Action:
+                  - redshift:DescribeClusters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+
+  # Redshift IAM Role for S3 access
+  RedshiftS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'redshift-s3-access-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub 'redshift-s3-access-${Environment}'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}/*'
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProcessedDataBucketName}'
+
+Outputs:
+  S3AccessRoleArn:
+    Description: ARN of the S3 access role
+    Value: !GetAtt S3AccessRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3AccessRoleArn'
+
+  GlueServiceRoleArn:
+    Description: ARN of the Glue service role
+    Value: !GetAtt GlueServiceRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueServiceRoleArn'
+
+  GlueCrawlerRoleArn:
+    Description: ARN of the Glue crawler role
+    Value: !GetAtt GlueCrawlerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueCrawlerRoleArn'
+
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+
+  StepFunctionsExecutionRoleArn:
+    Description: ARN of the Step Functions execution role
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsExecutionRoleArn'
+
+  RedshiftS3RoleArn:
+    Description: ARN of the Redshift S3 access role
+    Value: !GetAtt RedshiftS3Role.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftS3RoleArn'

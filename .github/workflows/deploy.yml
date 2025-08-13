@@ -1,0 +1,79 @@
+name: Deploy AWS Data Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  DEV_ACCOUNT_ID: ${{ secrets.DEV_ACCOUNT_ID }}
+  PROD_ACCOUNT_ID: ${{ secrets.PROD_ACCOUNT_ID }}
+  S3_BUCKET: ${{ secrets.S3_BUCKET }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    runs-on: ubuntu-latest
+    
+    environment: ${{ inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ inputs.environment == 'prod' || github.ref == 'refs/heads/main' && format('arn:aws:iam::{0}:role/GitHubActionsRole', env.PROD_ACCOUNT_ID) || format('arn:aws:iam::{0}:role/GitHubActionsRole', env.DEV_ACCOUNT_ID) }}
+          role-session-name: GitHubActionsSession
+
+      - name: Set environment variables
+        run: |
+          echo "ENVIRONMENT=${{ inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}" >> $GITHUB_ENV
+          echo "STACK_NAME=aws-data-pipeline-${{ inputs.environment || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}" >> $GITHUB_ENV
+
+      - name: Upload Glue Scripts to S3
+        run: |
+          aws s3 sync ./glue/scripts/ s3://${{ env.S3_BUCKET }}/glue-scripts/${{ env.ENVIRONMENT }}/ --delete
+
+      - name: Package CloudFormation template
+        run: |
+          aws cloudformation package \
+            --template-file ./cfn/pipeline.yaml \
+            --s3-bucket ${{ env.S3_BUCKET }} \
+            --s3-prefix cfn-artifacts/${{ env.ENVIRONMENT }}/ \
+            --output-template-file packaged.yaml
+
+      - name: Deploy CloudFormation stack
+        run: |
+          aws cloudformation deploy \
+            --template-file packaged.yaml \
+            --stack-name ${{ env.STACK_NAME }} \
+            --parameter-overrides \
+              Environment=${{ env.ENVIRONMENT }} \
+              S3Bucket=${{ env.S3_BUCKET }} \
+              GlueScriptPath=s3://${{ env.S3_BUCKET }}/glue-scripts/${{ env.ENVIRONMENT }}/ \
+            --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
+            --no-fail-on-empty-changeset
+
+      - name: Output stack information
+        run: |
+          echo "Deployment completed for ${{ env.ENVIRONMENT }} environment"
+          aws cloudformation describe-stacks --stack-name ${{ env.STACK_NAME }} --query 'Stacks[0].Outputs'
