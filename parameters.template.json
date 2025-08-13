@@ -6,31 +6,31 @@
         },
         {
             "ParameterKey": "S3Bucket",
-            "ParameterValue": "your-bucket-name"
+            "ParameterValue": "REPLACE_WITH_YOUR_BUCKET_NAME"
         },
         {
             "ParameterKey": "RedshiftClusterEndpoint",
-            "ParameterValue": "your-cluster-endpoint"
+            "ParameterValue": "REPLACE_WITH_YOUR_CLUSTER_ENDPOINT"
         },
         {
             "ParameterKey": "RedshiftDBName",
-            "ParameterValue": "your-database"
+            "ParameterValue": "REPLACE_WITH_YOUR_DB_NAME"
         },
         {
             "ParameterKey": "RedshiftTableName",
-            "ParameterValue": "your-table"
+            "ParameterValue": "REPLACE_WITH_YOUR_TABLE_NAME"
         },
         {
             "ParameterKey": "RedshiftUsername",
-            "ParameterValue": "your-username"
+            "ParameterValue": "REPLACE_WITH_YOUR_USERNAME"
         },
         {
             "ParameterKey": "RedshiftPassword",
-            "ParameterValue": "your-password"
+            "ParameterValue": "REPLACE_WITH_YOUR_PASSWORD"
         },
         {
             "ParameterKey": "GlueScriptPath",
-            "ParameterValue": "s3://your-bucket-name/glue/scripts/"
+            "ParameterValue": "s3://REPLACE_WITH_YOUR_BUCKET/glue/scripts/"
         }
     ]
 }
